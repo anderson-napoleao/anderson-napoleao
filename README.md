@@ -1056,3 +1056,173 @@ Se quiser, eu te passo as implementações de:
     IdempotencyRepository (Redis),
 
     e o validateConsistency chamando os micros reais de contas/contratos.
+
+  uma ideia pra desenvolver front e back em paralelo? e como ficaria a integracao?
+O ChatGPT disse:
+
+Boa! Dá pra tocar front e back em paralelo com bem menos atrito se você “congela” o contrato cedo e usa mocks confiáveis. Aqui vai um plano enxuto (mas de produção) e como fica a integração.
+1) Comece pelo contrato (API-first)
+
+    Escreva um OpenAPI com:
+
+        endpoints, query params, headers (ex.: X-Request-Id, Idempotency-Key)
+
+        modelos de request/response
+
+        errors padronizados (error, code, details)
+
+        paginação (offset ou cursor), cache headers (ETag), idempotência
+
+    Valide/linte com Spectral e publique o YAML no repo (ex.: /contracts/portability-bff.yaml).
+
+2) Suba um mock server estável
+
+    Use Prism (OpenAPI → mock HTTP) ou WireMock com stubs.
+
+    Endereço fixo pra equipe (docker compose/k8s namespace).
+
+    Coloque exemplos realistas no OpenAPI (example:) pra já renderizar no mock.
+
+3) Gere SDK do front e DTOs do back
+
+    Front: OpenAPI Generator → client TypeScript (fetch/axios).
+    O front já “fala” com o contrato, sem depender do back real.
+
+    Back (BFF): opcional gerar modelos/validators a partir do mesmo OpenAPI, ou validar com JSON Schema/AJV no gateway/BFF.
+
+4) Contract tests nos dois lados
+
+    Frontend: use MSW (Mock Service Worker) nos testes para simular respostas do mock (ou do OpenAPI).
+
+    Backend (BFF): rode Dredd/Prism/OpenAPI validator contra o serviço real para garantir que o que o BFF entrega bate 100% no contrato.
+
+    Se quiser subir de nível, use Pact (CDC) do front → BFF (o front publica “expectativas”, o BFF verifica).
+
+5) Pipelines e gates
+
+    CI do contrato: lint + validação de breaking changes (ex.: oasdiff).
+
+    CI do BFF: roda contract tests (Dredd) + testes de integração.
+
+    CI do front: roda testes com MSW usando o contrato (sem back real).
+
+    Merge só se os três passarem (contrato, front, back).
+
+6) Ambientes de preview
+
+    Para PRs: um preview do mock (sempre disponível) e, quando possível, preview do BFF com os endpoints feitos.
+
+    Feature flags no front para alternar mock ↔ BFF real por rota.
+
+7) Dados de exemplo e cenários
+
+    Mantenha no repo uma pasta fixtures/ com payloads de:
+
+        cliente com/sem contas, instituições vazias, carteira grande
+
+        paginação com e sem nextCursor
+
+        erros: invalid_cpf, client_not_found, upstream_unavailable
+
+    O mock server usa esses fixtures; o front monta telas com eles desde o dia 1.
+
+8) Observabilidade desde o mock
+
+    Padronize correlação: X-Request-Id ecoado pelo mock e pelo BFF.
+
+    Simule delays e falhas no mock para o front exercitar retries/toasts.
+
+Como fica a integração (bem direto)
+OpenAPI (trecho) — BFF
+
+paths:
+  /v1/portability/lookup:
+    get:
+      parameters:
+        - in: query; name: cpf; required: true; schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/LookupOk" }
+        "400": { $ref: "#/components/responses/InvalidCpf" }
+        "404": { $ref: "#/components/responses/ClientNotFound" }
+
+  /v1/portability/drafts:
+    post:
+      requestBody: { $ref: "#/components/requestBodies/DraftCreate" }
+      responses:
+        "201": { $ref: "#/components/responses/DraftCreated" }
+
+  /v1/portability/drafts/{draftId}/view:
+    get:
+      parameters:
+        - in: path; name: draftId; required: true; schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/DraftView" }
+
+  /v1/contracts/search:
+    get:
+      parameters:
+        - in: query; name: clientId; required: true; schema: { type: string }
+        - in: query; name: family; required: true; schema: { type: string }
+        - in: query; name: product; required: true; schema: { type: string }
+        - in: query; name: subproduct; required: true; schema: { type: string }
+        - in: query; name: size; schema: { type: integer, default: 20, maximum: 100 }
+        - in: query; name: cursor; schema: { type: string, nullable: true }
+      responses:
+        "200": { $ref: "#/components/responses/ContractsPage" }
+
+Front usando MSW (exemplo)
+
+// handlers.ts
+import { rest } from 'msw';
+
+export const handlers = [
+  rest.get('/v1/portability/lookup', (req, res, ctx) => {
+    const cpf = req.url.searchParams.get('cpf');
+    if (cpf === '00000000000') {
+      return res(ctx.status(404), ctx.json({ error: 'client_not_found' }));
+    }
+    return res(
+      ctx.status(200),
+      ctx.json({ client:{id:'c123',name:'Fulano'}, accounts:[/*...*/], institutions:[/*...*/], warnings:[] })
+    );
+  }),
+];
+
+Mock rápido com WireMock (exemplo de stub)
+
+{
+  "request": { "method": "GET", "urlPattern": "/v1/contracts/search\\?clientId=c123.*" },
+  "response": {
+    "status": 200,
+    "jsonBody": {
+      "content": [ { "contractId":"K9A1","family":"CREDITO","product":"CDC","subproduct":"CDC_VEICULO" } ],
+      "page": { "size": 20, "nextCursor": null }
+    },
+    "headers": { "Content-Type": "application/json" }
+  }
+}
+
+Teste de contrato do BFF com Dredd (CI)
+
+dredd contracts/portability-bff.yaml http://localhost:8080 \
+  --hookfiles tests/hooks.js
+
+Checklist prático pra você implementar já
+
+Escrever OpenAPI com os endpoints que definimos (lookup, drafts, view, catálogo, contratos, selections, submit).
+
+Rodar Prism ou WireMock com fixtures.
+
+Gerar SDK TS pro front (OpenAPI Generator) e apontar para o mock.
+
+BFF Camel começa a implementar rota por rota, validando com Dredd.
+
+MSW nos testes do front; Storybook para os componentes de cada tela/popup.
+
+CI com gates: Spectral + oasdiff + Dredd + testes do front.
+
+Planejar pré-visualização por PR (mock e BFF preview).
+
+    Adotar headers padrão (X-Request-Id, Idempotency-Key) desde o mock.
+
+Se quiser, eu já te mando um esqueleto de OpenAPI cobrindo toda a jornada e um docker-compose com Prism + WireMock pro time inteiro usar amanhã. Quer?
